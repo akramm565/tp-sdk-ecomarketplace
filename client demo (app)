@@ -1,11 +1,8 @@
-// SIMULATION : code présent sur le site e-commerce marchand
-// Lancer le backend d'abord (voir README), puis : node app.js
+
 
 const { EcoSDK } = require("./ecosdk");
 
-// =========================================================================
-// SANS SDK (approche verbeuse et sujette aux erreurs) — conservé pour comparer
-// =========================================================================
+
 const API_KEY = "mch_live_99x821a";
 const API_URL = "http://localhost:8000/v1/events/purchase";
 
