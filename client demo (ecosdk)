@@ -1,0 +1,145 @@
+/**
+ * EcoSDK — client léger pour l'API EcoMarketplace.
+ *
+ * Ce que le SDK cache au développeur marchand :
+ *  - authentification (header X-API-Key)
+ *  - sérialisation JSON et analyse des réponses
+ *  - timeout, retry avec backoff exponentiel (erreurs réseau, 429, 5xx)
+ *  - versionnement de l'API (le marchand ne manipule jamais "/v1/...")
+ *
+ * Node.js >= 18 (fetch natif).
+ */
+
+class EcoSDKError extends Error {
+  constructor(message, { status = null, body = null, retryable = false } = {}) {
+    super(message);
+    this.name = "EcoSDKError";
+    this.status = status;
+    this.body = body;
+    this.retryable = retryable;
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+class EcoSDK {
+  /**
+   * @param {object} options
+   * @param {string} options.apiKey            Clé API marchand (obligatoire)
+   * @param {string} [options.baseUrl]         URL de la plateforme
+   * @param {string} [options.apiVersion]      Version d'API ciblée (défaut "v1")
+   * @param {number} [options.maxRetries]      Tentatives supplémentaires (défaut 3)
+   * @param {number} [options.timeoutMs]       Timeout par requête (défaut 5000)
+   * @param {function} [options.onError]       Callback pour les erreurs du mode non bloquant
+   */
+  constructor({
+    apiKey,
+    baseUrl = "http://localhost:8000",
+    apiVersion = "v1",
+    maxRetries = 3,
+    timeoutMs = 5000,
+    onError = null,
+  } = {}) {
+    if (!apiKey) throw new EcoSDKError("EcoSDK : 'apiKey' est obligatoire.");
+    this.apiKey = apiKey;
+    this.baseUrl = baseUrl.replace(/\/+$/, "");
+    this.apiVersion = apiVersion;
+    this.maxRetries = maxRetries;
+    this.timeoutMs = timeoutMs;
+    this.onError = onError;
+  }
+
+  // ---------- API publique ----------
+
+  /** Enregistre un achat et renvoie { success, orderId, carbonEmittedKg }. */
+  async trackPurchase({ orderId, items }) {
+    this._validatePurchase({ orderId, items });
+    return this._request("POST", "/events/purchase", { orderId, items });
+  }
+
+  /** Alias présent dans l'énoncé du cours. */
+  trackCarbon(payload) {
+    return this.trackPurchase(payload);
+  }
+
+  /**
+   * Version non bloquante : retourne immédiatement, l'envoi (avec retries)
+   * se fait en arrière-plan. Une panne de la plateforme ne ralentit
+   * jamais le tunnel de commande du marchand.
+   */
+  trackPurchaseAsync(payload) {
+    this.trackPurchase(payload).catch((err) => {
+      if (this.onError) this.onError(err);
+    });
+  }
+
+  /** Statistiques cumulées du marchand. */
+  async getAnalytics() {
+    return this._request("GET", "/analytics/merchant");
+  }
+
+  // ---------- Interne ----------
+
+  _validatePurchase({ orderId, items }) {
+    if (!orderId || typeof orderId !== "string") {
+      throw new EcoSDKError("EcoSDK : 'orderId' (string) est obligatoire.");
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new EcoSDKError("EcoSDK : 'items' doit être un tableau non vide.");
+    }
+    for (const it of items) {
+      if (!it.category || typeof it.weightKg !== "number" || it.weightKg < 0) {
+        throw new EcoSDKError("EcoSDK : chaque item requiert 'category' et 'weightKg' (nombre >= 0).");
+      }
+    }
+  }
+
+  async _request(method, path, body) {
+    const url = `${this.baseUrl}/${this.apiVersion}${path}`;
+    let lastError;
+
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+      try {
+        const response = await fetch(url, {
+          method,
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-Key": this.apiKey,
+          },
+          body: body ? JSON.stringify(body) : undefined,
+          signal: controller.signal,
+        });
+        const data = await response.json().catch(() => null);
+
+        if (response.ok) return data;
+
+        const retryable = response.status === 429 || response.status >= 500;
+        lastError = new EcoSDKError(
+          response.status === 401
+            ? "Clé API invalide ou absente."
+            : `Erreur API (${response.status}) : ${data?.detail ?? "réponse inattendue"}`,
+          { status: response.status, body: data, retryable }
+        );
+        if (!retryable) throw lastError; // 4xx : inutile de réessayer
+      } catch (err) {
+        if (err instanceof EcoSDKError && !err.retryable) throw err;
+        lastError =
+          err instanceof EcoSDKError
+            ? err
+            : new EcoSDKError(`Erreur réseau : ${err.message}`, { retryable: true });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (attempt < this.maxRetries) {
+        // Backoff exponentiel avec jitter : ~200ms, 400ms, 800ms...
+        await sleep(200 * 2 ** attempt + Math.random() * 100);
+      }
+    }
+    throw lastError;
+  }
+}
+
+module.exports = { EcoSDK, EcoSDKError };
